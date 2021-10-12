@@ -1,0 +1,1042 @@
+---
+title: "Week 5 - NYPD Shooting Incidents Data Report"
+author: "Chris Lintecum"
+date: "9/18/2021"
+header-includes:
+- \usepackage{float}
+- \floatplacement{figure}{H}
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# NYPD Shootings Historical Analysis
+
+## Libraries used
+
+- tidyverse
+- lubridate
+- readr
+- kableExtra
+- float 
+
+## Overview
+
+The data sources examined in this analysis are available through the [NYC OpenData](https://opendata.cityofnewyork.us/) initiative. The NYPD [shooting incidents data](https://data.cityofnewyork.us/Public-Safety/NYPD-Shooting-Incident-Data-Historic-/833y-fsy8) comprises a list of all reported shooting incidents occurring in NYC from 2006 to 2020 along with information about the location, time, and demographics for suspects and victims. This list has been combined with population data from the [2010 Census](https://data.cityofnewyork.us/City-Government/New-York-City-Population-by-Borough-1950-2040/xywu-7bv9) as well as [social indicator](https://data.cityofnewyork.us/Social-Services/Social-Indicator-Report-Data/8ek7-jxw6) data published by the Mayor's Office for Economic Opportunity in order to calculate the rate of incidents per thousand people per borough, which is used as a baseline for measuring the correlation between shooting incidents, poverty rates, and violent crime rates more broadly.  Finally, I have tried to limit my bias by confining the analysis and data modeling to the geography of the five boroughs.
+
+```{r, echo=FALSE, , message=FALSE}
+library(lubridate)
+library(tidyverse)
+library(readr)
+library(kableExtra)
+library(float)
+```
+
+```{r import_data, echo=FALSE, message=FALSE}
+shooting_incidents_data_url = "https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD"
+nypd_shootings = read_csv(shooting_incidents_data_url)
+
+social_indicators_data_url = "https://data.cityofnewyork.us/api/views/8ek7-jxw6/rows.csv?accessType=DOWNLOAD"
+social_indicators = read_csv(social_indicators_data_url)
+
+population_data_url = "https://data.cityofnewyork.us/api/views/xywu-7bv9/rows.csv?accessType=DOWNLOAD"
+population_data = read_csv(population_data_url)
+
+```
+
+```{r tidy_pop, echo=FALSE,message=FALSE, warnings=FALSE}
+population_data <- population_data %>%
+  select(c(Borough, `2000`, `2010`)) %>%
+  mutate(
+    `2006` = `2000`,
+    `2007` = `2000`,
+    `2008` = `2000`,
+    `2009` = `2000`,
+    `2011` = `2010`,
+    `2012` = `2010`,
+    `2013` = `2010`,
+    `2014` = `2010`,
+    `2015` = `2010`,
+    `2016` = `2010`,
+    `2017` = `2010`,
+    `2018` = `2010`,
+  ) %>%
+  pivot_longer(cols = starts_with("20"),
+               names_to = "YEAR",
+               values_to = "Population") %>%
+  arrange(YEAR) %>%
+  filter(!grepl('NYC Total', Borough)) %>%
+  mutate(YEAR = as.numeric(YEAR)) %>%
+  rename(BORO = Borough) %>%
+  filter(YEAR > 2000)
+```
+
+```{r new_run, echo=FALSE,message=FALSE}
+social_indicators_tidy_new <- social_indicators %>%
+  select(
+    -c(
+      indicator_id,
+      domain,
+      domain_id,
+      agency_name,
+      industry,
+      agency_city_id,
+      dimension_category_id,
+      dimension_id,
+      domain
+    )
+  )
+
+borough_data <- social_indicators_tidy_new %>%
+  filter(dimension_category == "Borough")
+
+poverty_rates <- borough_data %>%
+  filter(indicator_name == "NYCgov Poverty Rate") %>%
+  filter(period > 2005) %>%
+  arrange(period) %>%
+  mutate(value = as.numeric(value)) %>%
+  rename(YEAR = period,
+         BORO = dimension,
+         Poverty_Rate = value) %>%
+  select(c(BORO, YEAR, Poverty_Rate))
+```
+
+```{r tidy_nypd_shootings_data, echo=FALSE, message=FALSE}
+nypd_shootings_tidy <- nypd_shootings %>%
+  select(
+    -c(
+      INCIDENT_KEY,
+      OCCUR_TIME,
+      PRECINCT,
+      JURISDICTION_CODE,
+      LOCATION_DESC,
+      STATISTICAL_MURDER_FLAG,
+      X_COORD_CD,
+      Y_COORD_CD,
+      Latitude,
+      Longitude,
+      Lon_Lat
+    )
+  ) %>%
+  rename(DATE = `OCCUR_DATE`) %>%
+  mutate(DATE = mdy(DATE)) %>%
+  mutate(YEAR = year(DATE))
+```
+
+```{r annual_totals_per_boro, echo=FALSE, message=FALSE}
+annual_totals_per_boro <- nypd_shootings_tidy %>%
+  group_by(BORO, YEAR) %>%
+  count(YEAR) %>%
+  mutate(BORO = str_to_title(BORO)) %>%
+  filter(YEAR < 2019) %>%
+  ungroup()
+
+boro_totals_with_indicators <- annual_totals_per_boro %>%
+  full_join(poverty_rates) %>%
+  rename(Shooting_Incidents = n)
+
+boro_totals_with_indicators <- boro_totals_with_indicators %>%
+  full_join(population_data) %>%
+  select(c(BORO, YEAR, Shooting_Incidents, Poverty_Rate, Population)) %>%
+  mutate(Shootings_Per_Thousand = 1000 * Shooting_Incidents / Population)
+
+poverty_model_new <-
+  lm(`Shootings_Per_Thousand` ~ `Poverty_Rate`, data = boro_totals_with_indicators)
+
+
+boro_totals_with_indicators <- boro_totals_with_indicators %>%
+  mutate(Predicted_Shootings_Per_Thousand = predict(poverty_model_new)) %>%
+  mutate(Predicted_Shooting_Incidents = Predicted_Shootings_Per_Thousand *
+           Population / 1000)
+
+final_counts <- boro_totals_with_indicators %>%
+  group_by(BORO) %>%
+  summarize(
+    Shooting_Incidents = sum(Shooting_Incidents),
+    Predicted_Shooting_Incidents = sum(Predicted_Shooting_Incidents)
+  )
+
+final_counts <-
+  rbind(final_counts, c("Total", colSums(final_counts[, 2:3]))) %>%
+  mutate(
+    Shooting_Incidents = as.numeric(Shooting_Incidents),
+    Predicted_Shooting_Incidents = as.numeric(Predicted_Shooting_Incidents)
+  )
+
+final_counts_by_year <- boro_totals_with_indicators %>%
+  group_by(YEAR) %>%
+  summarize(
+    Shooting_Incidents = sum(Shooting_Incidents),
+    Predicted_Shooting_Incidents = sum(Predicted_Shooting_Incidents)
+  )
+
+```
+\newpage
+
+<!-- ```{r pop_table,echo=FALSE, message=FALSE, fig.dim = c(12, 8), fig.align="center"} -->
+<!-- population_table <- population_data -->
+
+<!-- population_table <- population_table %>% -->
+<!--   filter(YEAR > 2017) %>% -->
+<!--   select(c(BORO, Population)) -->
+<!-- kable( -->
+<!--   population_table, -->
+<!--   align = "cc", -->
+<!--   digits = 1, -->
+<!--   linesep = "", -->
+<!--   format="latex", -->
+<!--   format.args = list(big.mark = ","), -->
+<!--   col.names = c("Borough", "Population"),  -->
+<!--   caption = "Borough Populations: 2006 to 2020", -->
+<!--   booktabs = T -->
+<!-- ) %>% -->
+<!--   kable_styling(latex_options=c("striped","HOLD_position"), position="center") %>% -->
+<!--   column_spec(column = 1, width = "3cm") %>% -->
+<!--   column_spec(column = 2, width = "3cm") -->
+<!-- ``` -->
+
+## Analysis
+
+The historical analysis shows that from 2011 to 2019 the number of reported shooting incidents decreased by 53% followed by a sharp 100% rise in 2020 back to pre-2011 levels.
+
+```{r yearly_totals, echo=FALSE, message=FALSE, fig.dim = c(10, 6), fig.align="center"}
+totals_by_year <- nypd_shootings_tidy %>%
+  count(YEAR)
+
+totals_by_year %>%
+  ggplot(aes(x = YEAR, y = n)) +
+  theme_bw() +
+  scale_x_continuous(breaks = seq(2006, 2020, 1)) +
+  geom_bar(stat = "identity", fill="gray84") +
+  theme_bw() +
+  theme(
+    legend.title = element_blank(),
+    legend.position = "bottom",
+    text = element_text(size=16),
+    axis.text.x = element_text(angle = 0)
+  ) +
+  labs(title = "NYC Shooting Incidents: 2006-2020", y = NULL, x = NULL)
+
+totals_by_year_per_boro <- nypd_shootings_tidy %>%
+  count(YEAR,BORO) %>%
+  pivot_wider(names_from=BORO,values_from=n) %>%
+  rename(STATENISLAND="STATEN ISLAND") %>%
+  mutate(TOTAL=BRONX+BROOKLYN+MANHATTAN+QUEENS+STATENISLAND)
+```
+
+```{r annual_totals_table ,echo=FALSE, message=FALSE, fig.dim = c(8, 4), fig.align="center"}
+kable(
+  totals_by_year,
+  align = "cc",
+  digits = 1,
+  linesep = "",
+  format="latex",
+  col.names = c("Year", "Reported Shooting Incidents"),
+  caption = "Reported Shooting Incidents: 2006 to 2020",
+  booktabs = T
+) %>%
+  kable_styling(latex_options=c("striped","HOLD_position"), position="center") %>%
+  column_spec(column = 1, width = "3cm") %>%
+  column_spec(column = 2, width = "3cm")
+```
+
+\newpage
+The general shape of the overall trend was consistent across the five individual boroughs and demographics of reported shooting incident victims.
+
+```{r yearly_totals_line_chart, echo=FALSE, message=FALSE, fig.dim = c(12, 8), fig.align="center"}
+totals_by_year_per_boro %>%
+  ggplot(aes(x = YEAR, y = TOTAL)) +
+  theme_bw() +
+  scale_x_continuous(breaks = seq(2006, 2020, 1)) +
+  scale_y_continuous(limits = c(0, 2500)) +
+  geom_line(aes(color = "TOTAL")) +
+  geom_point(aes(color = "TOTAL")) +
+  geom_line(aes(y = BROOKLYN, color = "BROOKLYN")) +
+  geom_point(aes(y = BROOKLYN, color = "BROOKLYN")) +
+  geom_line(aes(y = MANHATTAN, color = "MANHATTAN")) +
+  geom_point(aes(y = MANHATTAN, color = "MANHATTAN")) +
+  geom_line(aes(y = BRONX, color = "BRONX")) +
+  geom_point(aes(y = BRONX, color = "BRONX")) +
+  geom_line(aes(y = QUEENS, color = "QUEENS")) +
+  geom_point(aes(y = QUEENS, color = "QUEENS")) +
+  geom_line(aes(y = STATENISLAND, color = "STATENISLAND")) +
+  geom_point(aes(y = STATENISLAND, color = "STATENISLAND")) +
+  theme(
+    legend.direction = "vertical",
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 14),
+    legend.justification = c("right", "top"),
+    legend.box.just = "right",
+    legend.margin = margin(4, 4, 4, 4),
+    axis.text.x = element_text(angle = 0),
+    text = element_text(size=16)
+  ) +
+  scale_color_manual(
+    labels = c(
+      "Bronx",
+      "Brooklyn",
+      "Manhattan",
+      "Queens",
+      "Staten Island",
+      "Total"
+    ),
+    values = c("firebrick3", "slateblue", "green4", "gold3", "deepskyblue3","rosybrown4")
+  ) +
+  labs(title = "Shooting Incidents by Borough: 2006-2020", y = NULL, x = NULL)
+```
+
+```{r annual_totals_per_borough_chart, echo=FALSE, message=FALSE, warning=FALSE, fig.dim= c(9,6), fig.align="center"}
+boro_annual_totals_table <- totals_by_year_per_boro %>%
+  select(-c(TOTAL))
+kable(
+  boro_annual_totals_table,
+  align = "cccccc",
+  digits = 1,
+  linesep = "",
+  format = "latex",
+  col.names = c(
+    "Year",
+    "Bronx",
+    "Brooklyn",
+    "Manhattan",
+    "Queens",
+    "Staten Island"
+  ),
+  caption = "Reported Shooting Incidents by Borough: 2006 to 2020",
+  booktabs = T
+) %>%
+  kable_styling(latex_options = c("striped", "HOLD_position"),
+                position = "center") %>%
+  column_spec(column = 1, width = "2cm") %>%
+  column_spec(column = 2, width = "2cm") %>%
+  column_spec(column = 3, width = "2cm") %>%
+  column_spec(column = 4, width = "2cm") %>%
+  column_spec(column = 5, width = "2cm") %>%
+  column_spec(column = 6, width = "2cm")
+```
+
+\newpage
+
+```{r shootings_per_1000_chart, echo=FALSE, message=FALSE, fig.dim = c(12, 8), fig.align="center"}
+shootings_per_1000_data <- annual_totals_per_boro %>%
+  full_join(population_data) %>%
+  mutate(Shootings_Per_Thousand = 1000 * n / Population) %>%
+  select(c(BORO, YEAR, Shootings_Per_Thousand)) %>%
+  group_by(BORO, YEAR, Shootings_Per_Thousand) %>%
+  pivot_wider(names_from=BORO,values_from=Shootings_Per_Thousand)
+  
+shootings_per_1000_data %>%
+  ggplot(aes(x = YEAR, y = Shootings_Per_Thousand)) +
+  theme_bw() +
+  scale_x_continuous(breaks = seq(2006, 2020, 1)) +
+  scale_y_continuous(limits = c(0, 0.5)) +
+  geom_line(aes(y = Brooklyn, color = "Brooklyn")) +
+  geom_point(aes(y = Brooklyn, color = "Brooklyn")) +
+  geom_line(aes(y = Manhattan, color = "Manhattan")) +
+  geom_point(aes(y = Manhattan, color = "Manhattan")) +
+  geom_line(aes(y = Bronx, color = "Bronx")) +
+  geom_point(aes(y = Bronx, color = "Bronx")) +
+  geom_line(aes(y = Queens, color = "Queens")) +
+  geom_point(aes(y = Queens, color = "Queens")) +
+  geom_line(aes(y = `Staten Island`, color = "Staten Island")) +
+  geom_point(aes(y = `Staten Island`, color = "Staten Island")) +
+  theme(
+    legend.direction = "vertical",
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 14),
+    legend.justification = c("right", "top"),
+    legend.box.just = "right",
+    legend.margin = margin(4, 4, 4, 4),
+    axis.text.x = element_text(angle = 0),
+    text = element_text(size=16)
+  ) +
+  scale_color_manual(
+    labels = c(
+      "Bronx",
+      "Brooklyn",
+      "Manhattan",
+      "Queens",
+      "Staten Island",
+      "Total"
+    ),
+    values = c("firebrick3", "slateblue", "green4", "gold3", "deepskyblue3","rosybrown4")
+  ) +
+  labs(title = "Shooting Incidents Per Thousand by Borough: 2006-2018", y = NULL, x = NULL)
+```
+
+```{r shootings_per_1000_table, echo=FALSE, message=FALSE, warning=FALSE, fig.dim= c(9,6), fig.align="center"}
+kable(
+  shootings_per_1000_data,
+  align = "cccccc",
+  digits = 2,
+  linesep = "",
+  format = "latex",
+  col.names = c(
+    "Year",
+    "Bronx",
+    "Brooklyn",
+    "Manhattan",
+    "Queens",
+    "Staten Island"
+  ),
+  caption = "Shootings Incidents Per Thousand by Borough: 2006 to 2018",
+  booktabs = T
+) %>%
+  kable_styling(latex_options = c("striped", "HOLD_position"),
+                position = "center") %>%
+  column_spec(column = 1, width = "2cm") %>%
+  column_spec(column = 2, width = "2cm") %>%
+  column_spec(column = 3, width = "2cm") %>%
+  column_spec(column = 4, width = "2cm") %>%
+  column_spec(column = 5, width = "2cm") %>%
+  column_spec(column = 6, width = "2cm")
+```
+
+
+<!-- \newpage -->
+
+<!-- ```{r population_table, echo=FALSE, message=FALSE, warning=FALSE, fig.dim= c(9,6), fig.align="center"}``` -->
+
+
+\newpage
+
+The breakdown of shooting incidents by categories of victim race and sex follows a similar pattern as the overall historical trend with differences only in the degree of changes over the same period. 
+
+```{r nypd_shootings_by_victim_demographic, echo=FALSE, message=FALSE,warning=FALSE, fig.dim = c(12, 8), fig.align="center"}
+annual_totals_by_victim_sex_and_race <- nypd_shootings_tidy %>%
+  count(YEAR, VIC_SEX, VIC_RACE) %>%
+  pivot_wider(names_from = c(VIC_SEX, VIC_RACE),
+              values_from = n) %>%
+  rename(ASIAN_PACIFIC_ISLANDER_FEMALE = "F_ASIAN / PACIFIC ISLANDER") %>%
+  rename(ASIAN_PACIFIC_ISLANDER_MALE = "M_ASIAN / PACIFIC ISLANDER") %>%
+  rename(AMERICAN_INDIAN_ALASKAN_NATIVE_FEMALE = "F_AMERICAN INDIAN/ALASKAN NATIVE") %>%
+  rename(AMERICAN_INDIAN_ALASKAN_NATIVE_MALE = "M_AMERICAN INDIAN/ALASKAN NATIVE") %>%
+  rename(BLACK_HISPANIC_FEMALE = "F_BLACK HISPANIC") %>%
+  rename(BLACK_HISPANIC_MALE = "M_BLACK HISPANIC") %>%
+  rename(WHITE_HISPANIC_FEMALE = "F_WHITE HISPANIC") %>%
+  rename(WHITE_HISPANIC_MALE = "M_WHITE HISPANIC") %>%
+  rename(WHITE_FEMALE = "F_WHITE") %>%
+  rename(WHITE_MALE = "M_WHITE") %>%
+  rename(BLACK_FEMALE = "F_BLACK") %>%
+  rename(BLACK_MALE = "M_BLACK") %>%
+  rename(U_BLACK_HISPANIC = "U_BLACK HISPANIC") %>%
+  rename(U_WHITE_HISPANIC = "U_WHITE HISPANIC") %>%
+  replace_na(
+    list(
+      AMERICAN_INDIAN_ALASKAN_NATIVE_FEMALE = 0,
+      AMERICAN_INDIAN_ALASKAN_NATIVE_MALE = 0,
+      U_BLACK = 0,
+      F_UNKNOWN = 0,
+      M_UNKNOWN = 0,
+      U_UNKNOWN = 0,
+      ASIAN_PACIFIC_ISLANDER_FEMALE = 0,
+      ASIAN_PACIFIC_ISLANDER_MALE = 0,
+      U_BLACK_HISPANIC = 0
+    )
+  ) %>%
+  mutate(
+    TOTAL = ASIAN_PACIFIC_ISLANDER_FEMALE + ASIAN_PACIFIC_ISLANDER_MALE + AMERICAN_INDIAN_ALASKAN_NATIVE_FEMALE +
+      AMERICAN_INDIAN_ALASKAN_NATIVE_MALE + BLACK_HISPANIC_FEMALE + BLACK_HISPANIC_MALE +
+      WHITE_HISPANIC_FEMALE + WHITE_HISPANIC_MALE + WHITE_FEMALE + WHITE_MALE +
+      BLACK_FEMALE + BLACK_MALE + F_UNKNOWN + M_UNKNOWN + U_BLACK + U_UNKNOWN +
+      U_BLACK_HISPANIC
+  )
+
+percent_change_by_victim_race_and_sex_male <- annual_totals_by_victim_sex_and_race %>%
+  mutate(
+    BLACK_MALE_YOY = (BLACK_MALE - lag(BLACK_MALE)) / lag(BLACK_MALE),
+    BLACK_HISPANIC_MALE_YOY = (BLACK_HISPANIC_MALE - lag(BLACK_HISPANIC_MALE)) / lag(BLACK_HISPANIC_MALE),
+    WHITE_MALE_YOY = (WHITE_MALE - lag(WHITE_MALE)) / lag(WHITE_MALE),
+    WHITE_HISPANIC_MALE_YOY = (WHITE_HISPANIC_MALE - lag(WHITE_HISPANIC_MALE)) / lag(WHITE_HISPANIC_MALE),
+    ASIAN_PACIFIC_ISLANDER_MALE_YOY = (ASIAN_PACIFIC_ISLANDER_MALE - lag(ASIAN_PACIFIC_ISLANDER_MALE)) / lag(ASIAN_PACIFIC_ISLANDER_MALE),
+  ) %>%
+  mutate(
+    BLACK_MALE_YOY = BLACK_MALE_YOY * 100,
+    BLACK_HISPANIC_MALE_YOY = BLACK_HISPANIC_MALE_YOY* 100,
+    WHITE_MALE_YOY = WHITE_MALE_YOY* 100,
+    WHITE_HISPANIC_MALE_YOY = WHITE_HISPANIC_MALE_YOY* 100,
+    ASIAN_PACIFIC_ISLANDER_MALE_YOY = ASIAN_PACIFIC_ISLANDER_MALE_YOY* 100,
+  ) %>%
+  select(c(YEAR, BLACK_MALE_YOY, BLACK_HISPANIC_MALE_YOY, WHITE_MALE_YOY, WHITE_HISPANIC_MALE_YOY, ASIAN_PACIFIC_ISLANDER_MALE_YOY))
+
+percent_change_by_victim_race_and_sex_female <- annual_totals_by_victim_sex_and_race %>%
+  mutate(
+    BLACK_FEMALE_YOY = (BLACK_FEMALE - lag(BLACK_FEMALE)) / lag(BLACK_FEMALE),
+    BLACK_HISPANIC_FEMALE_YOY = (BLACK_HISPANIC_FEMALE - lag(BLACK_HISPANIC_FEMALE)) / lag(BLACK_HISPANIC_FEMALE),
+    WHITE_FEMALE_YOY = (WHITE_FEMALE - lag(WHITE_FEMALE)) / lag(WHITE_FEMALE),
+    WHITE_HISPANIC_FEMALE_YOY = (WHITE_HISPANIC_FEMALE - lag(WHITE_HISPANIC_FEMALE)) / lag(WHITE_HISPANIC_FEMALE),
+    ASIAN_PACIFIC_ISLANDER_FEMALE_YOY = (ASIAN_PACIFIC_ISLANDER_FEMALE - lag(ASIAN_PACIFIC_ISLANDER_FEMALE)) / lag(ASIAN_PACIFIC_ISLANDER_FEMALE),
+  ) %>%
+  mutate(
+    BLACK_FEMALE_YOY = BLACK_FEMALE_YOY * 100,
+    BLACK_HISPANIC_FEMALE_YOY = BLACK_HISPANIC_FEMALE_YOY* 100,
+    WHITE_FEMALE_YOY = WHITE_FEMALE_YOY* 100,
+    WHITE_HISPANIC_FEMALE_YOY = WHITE_HISPANIC_FEMALE_YOY* 100,
+    ASIAN_PACIFIC_ISLANDER_FEMALE_YOY = ASIAN_PACIFIC_ISLANDER_FEMALE_YOY* 100,
+  ) %>%
+  select(c(YEAR, BLACK_FEMALE_YOY, BLACK_HISPANIC_FEMALE_YOY, WHITE_FEMALE_YOY, WHITE_HISPANIC_FEMALE_YOY, ASIAN_PACIFIC_ISLANDER_FEMALE_YOY))
+
+percent_change_by_victim_race_and_sex_male <- na.omit(percent_change_by_victim_race_and_sex_male) %>%
+  filter(YEAR > 2019)
+
+percent_change_by_victim_race_and_sex_female <- na.omit(percent_change_by_victim_race_and_sex_female) %>%
+  filter(YEAR > 2019)
+
+overall_percent_change_by_victim_race_and_sex_male <- annual_totals_by_victim_sex_and_race %>%
+  mutate(
+    BLACK_MALE_YOY = (BLACK_MALE - lag(BLACK_MALE, 13)) / lag(BLACK_MALE, 13),
+    BLACK_HISPANIC_MALE_YOY = (BLACK_HISPANIC_MALE - lag(BLACK_HISPANIC_MALE, 13)) / lag(BLACK_HISPANIC_MALE, 13),
+    WHITE_MALE_YOY = (WHITE_MALE - lag(WHITE_MALE, 13)) / lag(WHITE_MALE, 13),
+    WHITE_HISPANIC_MALE_YOY = (WHITE_HISPANIC_MALE - lag(WHITE_HISPANIC_MALE, 13)) / lag(WHITE_HISPANIC_MALE, 13),
+    ASIAN_PACIFIC_ISLANDER_MALE_YOY = (ASIAN_PACIFIC_ISLANDER_MALE - lag(ASIAN_PACIFIC_ISLANDER_MALE, 13)) / lag(ASIAN_PACIFIC_ISLANDER_MALE, 13),
+  ) %>%
+  mutate(
+    BLACK_MALE_YOY = BLACK_MALE_YOY * 100,
+    BLACK_HISPANIC_MALE_YOY = BLACK_HISPANIC_MALE_YOY* 100,
+    WHITE_MALE_YOY = WHITE_MALE_YOY* 100,
+    WHITE_HISPANIC_MALE_YOY = WHITE_HISPANIC_MALE_YOY* 100,
+    ASIAN_PACIFIC_ISLANDER_MALE_YOY = ASIAN_PACIFIC_ISLANDER_MALE_YOY* 100,
+  ) %>%
+  select(c(YEAR, BLACK_MALE_YOY, BLACK_HISPANIC_MALE_YOY, WHITE_MALE_YOY, WHITE_HISPANIC_MALE_YOY, ASIAN_PACIFIC_ISLANDER_MALE_YOY))
+
+overall_percent_change_by_victim_race_and_sex_female <- annual_totals_by_victim_sex_and_race %>%
+  mutate(
+    BLACK_FEMALE_YOY = (BLACK_FEMALE - lag(BLACK_FEMALE, 13)) / lag(BLACK_FEMALE, 13),
+    BLACK_HISPANIC_FEMALE_YOY = (BLACK_HISPANIC_FEMALE - lag(BLACK_HISPANIC_FEMALE, 13)) / lag(BLACK_HISPANIC_FEMALE, 13),
+    WHITE_FEMALE_YOY = (WHITE_FEMALE - lag(WHITE_FEMALE, 13)) / lag(WHITE_FEMALE, 13),
+    WHITE_HISPANIC_FEMALE_YOY = (WHITE_HISPANIC_FEMALE - lag(WHITE_HISPANIC_FEMALE, 13)) / lag(WHITE_HISPANIC_FEMALE, 13),
+    ASIAN_PACIFIC_ISLANDER_FEMALE_YOY = (ASIAN_PACIFIC_ISLANDER_FEMALE - lag(ASIAN_PACIFIC_ISLANDER_FEMALE, 13)) / lag(ASIAN_PACIFIC_ISLANDER_FEMALE, 13),
+  ) %>%
+  mutate(
+    BLACK_FEMALE_YOY = BLACK_FEMALE_YOY * 100,
+    BLACK_HISPANIC_FEMALE_YOY = BLACK_HISPANIC_FEMALE_YOY* 100,
+    WHITE_FEMALE_YOY = WHITE_FEMALE_YOY* 100,
+    WHITE_HISPANIC_FEMALE_YOY = WHITE_HISPANIC_FEMALE_YOY* 100,
+    ASIAN_PACIFIC_ISLANDER_FEMALE_YOY = ASIAN_PACIFIC_ISLANDER_FEMALE_YOY* 100,
+  ) %>%
+  select(c(YEAR, BLACK_FEMALE_YOY, BLACK_HISPANIC_FEMALE_YOY, WHITE_FEMALE_YOY, WHITE_HISPANIC_FEMALE_YOY, ASIAN_PACIFIC_ISLANDER_FEMALE_YOY))
+
+overall_percent_change_by_victim_race_and_sex_male <- na.omit(overall_percent_change_by_victim_race_and_sex_male) %>%
+  filter(YEAR < 2020)
+
+overall_percent_change_by_victim_race_and_sex_female <- na.omit(overall_percent_change_by_victim_race_and_sex_female) %>%
+  filter(YEAR < 2020)
+
+
+annual_totals_by_victim_sex_and_race %>%
+  ggplot(aes(x = YEAR, y = ASIAN_PACIFIC_ISLANDER_MALE)) +
+  theme_bw() +
+  scale_x_continuous(breaks=seq(2006,2020,1)) +
+  scale_y_continuous(breaks = seq(0, 1300,100)) +
+  geom_line(aes(color = "ASIAN_PACIFIC_ISLANDER_MALE")) +
+  geom_point(aes(color = "ASIAN_PACIFIC_ISLANDER_MALE")) +
+  geom_line(aes(y=WHITE_HISPANIC_MALE, color = "WHITE_HISPANIC_MALE")) +
+  geom_point(aes(y=WHITE_HISPANIC_MALE, color = "WHITE_HISPANIC_MALE")) +
+  geom_line(aes(y=BLACK_HISPANIC_MALE, color = "BLACK_HISPANIC_MALE")) +
+  geom_point(aes(y=BLACK_HISPANIC_MALE, color = "BLACK_HISPANIC_MALE")) +
+  geom_line(aes(y=WHITE_MALE, color = "WHITE_MALE")) +
+  geom_point(aes(y=WHITE_MALE, color = "WHITE_MALE")) +
+  geom_line(aes(y=BLACK_MALE, color = "BLACK_MALE")) +
+  geom_point(aes(y=BLACK_MALE, color = "BLACK_MALE")) +
+  scale_color_manual(
+    labels = c(
+      "Asian/Pacific Islander",
+      "Black Hispanic",
+      "Black",
+      "White Hispanic",
+      "White"
+    ),
+    values = c("firebrick3", "plum4", "green4", "gold3", "deepskyblue3")
+  ) +
+  theme(
+    legend.direction = "vertical",
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 14),
+    legend.justification = c("right", "top"),
+    legend.box.just = "right",
+    legend.margin = margin(4, 4, 4, 4),
+    axis.text.x = element_text(angle = 0),
+    text = element_text(size=16)
+  ) +
+  labs(title = "Shooting Incidents by Victim Sex and Race (Male)", y = NULL, x = NULL)
+
+male_victims_chart <- annual_totals_by_victim_sex_and_race %>%
+  select(c(YEAR,ASIAN_PACIFIC_ISLANDER_MALE,BLACK_MALE,BLACK_HISPANIC_MALE,WHITE_MALE,WHITE_HISPANIC_MALE))
+
+
+```
+
+```{r chart_victims_male, echo=FALSE, message=FALSE, warning=FALSE,fig.dim = c(9, 6), fig.align="center"}
+kable(
+  male_victims_chart,
+  align = "cccccc",
+  digits = 1,
+  linesep = "",
+  format = "latex",
+  col.names = c(
+    "Year",
+    "Asian/Pacific Islander",
+    "Black",
+    "Black Hispanic",
+    "White",
+    "White Hispanic"
+  ),
+  caption = "Shooting Incidents by Victim Sex and Race (Male)",
+  booktabs = T
+) %>%
+  kable_styling(latex_options = c("striped", "HOLD_position"),
+                position = "center") %>%
+  column_spec(column = 1, width = "2cm") %>%
+  column_spec(column = 2, width = "2cm") %>%
+  column_spec(column = 3, width = "2cm") %>%
+  column_spec(column = 4, width = "2cm") %>%
+  column_spec(column = 5, width = "2cm") %>%
+  column_spec(column = 6, width = "2cm")
+```
+
+\newpage
+
+```{r percent_change_2006_to_2019_female, echo=FALSE, message=FALSE, warning=FALSE,fig.dim = c(9, 6), fig.align="center"}
+overall_percent_change_by_victim_race_and_sex_female <- overall_percent_change_by_victim_race_and_sex_female %>%
+  select(-c(YEAR))
+kable(
+  overall_percent_change_by_victim_race_and_sex_female,
+  align = "ccccc",
+  digits = 1,
+  linesep = "",
+  format = "latex",
+  col.names = c(
+    "Black",
+    "Black Hispanic",
+    "White",
+    "White Hispanic",
+    "Asian/Pacific Islander"
+  ),
+  caption = "Percent Change from 2006 to 2020 by Victim Race and Sex (Female)",
+  booktabs = T
+) %>%
+  kable_styling(latex_options = c("striped", "HOLD_position"),
+                position = "center") %>%
+  column_spec(column = 1, width = "2cm") %>%
+  column_spec(column = 2, width = "2cm") %>%
+  column_spec(column = 3, width = "2cm") %>%
+  column_spec(column = 4, width = "2cm") %>%
+  column_spec(column = 5, width = "2cm")
+```
+
+```{r percent_change_2019_to_2020_female, echo=FALSE, message=FALSE, warning=FALSE,fig.dim = c(9, 6), fig.align="center"}
+
+percent_change_by_victim_race_and_sex_female <- percent_change_by_victim_race_and_sex_female %>%
+  select(-c(YEAR))
+kable(
+  percent_change_by_victim_race_and_sex_female,
+  align = "ccccc",
+  digits = 1,
+  linesep = "",
+  format = "latex",
+  col.names = c(
+    "Black",
+    "Black Hispanic",
+    "White",
+    "White Hispanic",
+    "Asian/Pacific Islander"
+  ),
+  caption = "Percent Change from 2019 to 2020 by Victim Race and Sex (Female)",
+  booktabs = T
+) %>%
+  kable_styling(latex_options = c("striped", "HOLD_position"),
+                position = "center") %>%
+  column_spec(column = 1, width = "2cm") %>%
+  column_spec(column = 2, width = "2cm") %>%
+  column_spec(column = 3, width = "2cm") %>%
+  column_spec(column = 4, width = "2cm") %>%
+  column_spec(column = 5, width = "2cm")
+```
+
+
+```{r percent_change_2006_to_2019, echo=FALSE, message=FALSE, warning=FALSE,fig.dim = c(9, 6), fig.align="center"}
+
+
+overall_percent_change_by_victim_race_and_sex_male <- overall_percent_change_by_victim_race_and_sex_male %>%
+  select(-c(YEAR))
+# BLACK_MALE_YOY, BLACK_HISPANIC_MALE_YOY, WHITE_MALE_YOY, WHITE_HISPANIC_MALE_YOY, ASIAN_PACIFIC_ISLANDER_MALE_YOY
+
+kable(
+  overall_percent_change_by_victim_race_and_sex_male,
+  align = "ccccc",
+  digits = 1,
+  linesep = "",
+  format = "latex",
+  col.names = c(
+    "Black",
+    "Black Hispanic",
+    "White",
+    "White Hispanic",
+    "Asian/Pacific Islander"
+  ),
+  caption = "Percent Change from 2006 to 2020 by Victim Race and Sex (Male)",
+  booktabs = T
+) %>%
+  kable_styling(latex_options = c("striped", "HOLD_position"),
+                position = "center") %>%
+  column_spec(column = 1, width = "2cm") %>%
+  column_spec(column = 2, width = "2cm") %>%
+  column_spec(column = 3, width = "2cm") %>%
+  column_spec(column = 4, width = "2cm") %>%
+  column_spec(column = 5, width = "2cm")
+```
+
+```{r percent_change_2019_to_2020, echo=FALSE, message=FALSE, warning=FALSE,fig.dim = c(9, 6), fig.align="center"}
+
+percent_change_by_victim_race_and_sex_male <- percent_change_by_victim_race_and_sex_male %>%
+  select(-c(YEAR))
+kable(
+  percent_change_by_victim_race_and_sex_male,
+  align = "ccccc",
+  digits = 1,
+  linesep = "",
+  format = "latex",
+  col.names = c(
+    "Black",
+    "Black Hispanic",
+    "White",
+    "White Hispanic",
+    "Asian/Pacific Islander"
+  ),
+  caption = "Percent Change from 2019 to 2020 by Victim Race and Sex (Male)",
+  booktabs = T
+) %>%
+  kable_styling(latex_options = c("striped", "HOLD_position"),
+                position = "center") %>%
+  column_spec(column = 1, width = "2cm") %>%
+  column_spec(column = 2, width = "2cm") %>%
+  column_spec(column = 3, width = "2cm") %>%
+  column_spec(column = 4, width = "2cm") %>%
+  column_spec(column = 5, width = "2cm")
+```
+
+
+\newpage
+
+```{r plot_victims_female, echo=FALSE, message=FALSE, warning=FALSE,fig.dim = c(12, 8), fig.align="center"}
+annual_totals_by_victim_sex_and_race %>%
+  ggplot(aes(x = YEAR, y = ASIAN_PACIFIC_ISLANDER_FEMALE)) +
+  theme_bw() +
+  scale_x_continuous(breaks = seq(2006, 2020, 1)) +
+  scale_y_continuous(breaks = seq(0, 150, 20)) +
+  geom_line(aes(color = "ASIAN_PACIFIC_ISLANDER_FEMALE")) +
+  geom_point(aes(color = "ASIAN_PACIFIC_ISLANDER_FEMALE")) +
+  geom_line(aes(y = WHITE_HISPANIC_FEMALE, color = "WHITE_HISPANIC_FEMALE")) +
+  geom_point(aes(y = WHITE_HISPANIC_FEMALE, color = "WHITE_HISPANIC_FEMALE")) +
+  geom_line(aes(y = BLACK_HISPANIC_FEMALE, color = "BLACK_HISPANIC_FEMALE")) +
+  geom_point(aes(y = BLACK_HISPANIC_FEMALE, color = "BLACK_HISPANIC_FEMALE")) +
+  geom_line(aes(y = WHITE_FEMALE, color = "WHITE_FEMALE")) +
+  geom_point(aes(y = WHITE_FEMALE, color = "WHITE_FEMALE")) +
+  geom_line(aes(y = BLACK_FEMALE, color = "BLACK_FEMALE")) +
+  geom_point(aes(y = BLACK_FEMALE, color = "BLACK_FEMALE")) +
+  scale_color_manual(
+    labels = c(
+      "Asian/Pacific Islander",
+      "Black",
+      "Black Hispanic",
+      "White",
+      "White Hispanic"
+    ),
+    values = c("firebrick3", "plum4", "green4", "gold3", "deepskyblue3")
+  ) +
+  theme(
+    legend.direction = "vertical",
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 14),
+    legend.justification = c("right", "top"),
+    legend.box.just = "right",
+    legend.margin = margin(4, 4, 4, 4),
+    axis.text.x = element_text(angle = 0),
+    text = element_text(size=16)
+  ) +
+  labs(title = "Shooting Incidents by Victim Sex and Race (Female)", y =
+         NULL, x = "Year")
+
+female_victims_chart <- annual_totals_by_victim_sex_and_race %>%
+  select(c(YEAR,ASIAN_PACIFIC_ISLANDER_FEMALE,BLACK_FEMALE,BLACK_HISPANIC_FEMALE,WHITE_FEMALE,WHITE_HISPANIC_FEMALE))
+```
+
+```{r chart_victims_female, echo=FALSE, message=FALSE, warning=FALSE,fig.dim = c(9, 8), fig.align="center"}
+kable(
+  female_victims_chart,
+  align = "cccccc",
+  digits = 1,
+  linesep = "",
+  format = "latex",
+  col.names = c(
+    "Year",
+    "Asian/Pacific Islander",
+    "Black",
+    "Black Hispanic",
+    "White",
+    "White Hispanic"
+  ),
+  caption = "Shooting Incidents by Victim Sex and Race (Female)",
+  booktabs = T
+) %>%
+  kable_styling(latex_options = c("striped", "HOLD_position"),
+                position = "center") %>%
+  column_spec(column = 1, width = "2cm") %>%
+  column_spec(column = 2, width = "2cm") %>%
+  column_spec(column = 3, width = "2cm") %>%
+  column_spec(column = 4, width = "2cm") %>%
+  column_spec(column = 5, width = "2cm") %>%
+  column_spec(column = 6, width = "2cm")
+```
+
+\newpage
+```{r victim_sex_chart, echo=FALSE, message=FALSE, warning=FALSE,fig.dim = c(12, 8), fig.align="center"}
+annual_totals_male_female <- annual_totals_by_victim_sex_and_race %>%
+  mutate(
+    TOTAL_MALE =
+      ASIAN_PACIFIC_ISLANDER_MALE +
+      AMERICAN_INDIAN_ALASKAN_NATIVE_MALE +
+      BLACK_HISPANIC_MALE +
+      WHITE_HISPANIC_MALE +
+      WHITE_MALE +
+      BLACK_MALE +
+      M_UNKNOWN
+    ) %>%
+  mutate(
+    TOTAL_FEMALE =
+      ASIAN_PACIFIC_ISLANDER_FEMALE +
+      AMERICAN_INDIAN_ALASKAN_NATIVE_FEMALE +
+      BLACK_HISPANIC_FEMALE +
+      WHITE_HISPANIC_FEMALE +
+      WHITE_FEMALE +
+      BLACK_FEMALE +
+      F_UNKNOWN
+    ) %>%
+  select(c(YEAR, TOTAL_MALE, TOTAL_FEMALE))
+
+annual_totals_male_female %>%
+  ggplot(aes(x = YEAR, y = TOTAL_FEMALE)) +
+  scale_x_continuous(breaks=seq(2006,2020,1)) +
+  scale_y_continuous(breaks = seq(0, 1900,100)) +
+  geom_line(aes(color = "TOTAL_FEMALE")) +
+  geom_point(aes(color = "TOTAL_FEMALE")) +
+  geom_line(aes(y=TOTAL_MALE, color = "TOTAL_MALE")) +
+  geom_point(aes(y=TOTAL_MALE, color = "TOTAL_MALE")) +
+  scale_color_manual(
+    labels = c(
+      "Female",
+      "Male"
+    ),
+    values = c("firebrick3", "green4")
+  ) +
+  theme_bw() +
+  theme(
+    legend.direction = "vertical",
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 14),
+    legend.justification = c("right", "top"),
+    legend.box.just = "right",
+    legend.margin = margin(4, 4, 4, 4),
+    axis.text.x = element_text(angle = 0),
+    text = element_text(size=16)
+  ) +
+  labs(title = "Shooting Incidents by Victim Sex",y=NULL, x=NULL)
+```
+
+```{r victim_sex_table, echo=FALSE, message=FALSE, warning=FALSE,fig.dim = c(9, 6), fig.align="center"}
+kable(
+  annual_totals_male_female,
+  align = "ccc",
+  digits = 1,
+  linesep = "",
+  format = "latex",
+  col.names = c(
+    "Year",
+    "Male",
+    "Female"
+  ),
+  caption = "Shooting Incidents by Victim Sex",
+  booktabs = T
+) %>%
+  kable_styling(latex_options = c("striped", "HOLD_position"),
+                position = "center") %>%
+  column_spec(column = 1, width = "2cm") %>%
+  column_spec(column = 2, width = "2cm") %>%
+  column_spec(column = 3, width = "2cm")
+```
+
+\newpage
+The trends in poverty rates over this same period of time were more varied and less cohesive when viewed comparatively by borough, fluctuating as much as 7% over the span of 12 years.
+
+```{r social_indicator_datasets, echo=FALSE, message=FALSE, fig.dim = c(12, 8), fig.align="center"}
+social_indicators_tidy <- social_indicators %>%
+    select(-c(indicator_id,domain,domain_id,agency_name,industry,agency_city_id,dimension_category_id,dimension_id,domain))
+
+indicators_by_boro <- social_indicators_tidy %>%
+    filter(dimension_category == "Borough")
+
+violent_crime <-indicators_by_boro %>%
+  filter(indicator_name == "Reported Violent Crime") %>%
+  filter(period > 2005) %>%
+  arrange(period) %>%
+  mutate(value = as.numeric(value)) %>%
+  select(-c(indicator_name,dimension_category,interval)) %>%
+  pivot_wider(names_from=dimension,values_from=value) %>%
+  rename(StatenIsland="Staten Island")
+
+poverty_rate <-indicators_by_boro %>%
+  filter(indicator_name == "NYCgov Poverty Rate") %>%
+  filter(period > 2005) %>%
+  arrange(period) %>%
+  mutate(value = as.numeric(value)) %>%
+  pivot_wider(names_from=dimension,values_from=value) %>%
+  rename(StatenIsland="Staten Island")
+
+poverty_rate %>%
+  ggplot(aes(x = period, y = Manhattan)) +
+  theme_bw() +
+  scale_x_continuous(breaks = seq(2006, 2018, 1)) +
+  scale_y_continuous(breaks = seq(0, 28, 2)) +
+  geom_line(aes(color = "Manhattan")) +
+  geom_point(aes(color = "Manhattan")) +
+  geom_line(aes(y = Brooklyn, color = "Brooklyn")) +
+  geom_point(aes(y = Brooklyn, color = "Brooklyn")) +
+  geom_line(aes(y = Bronx, color = "Bronx")) +
+  geom_point(aes(y = Bronx, color = "Bronx")) +
+  geom_line(aes(y = Queens, color = "Queens")) +
+  geom_point(aes(y = Queens, color = "Queens")) +
+  geom_line(aes(y = StatenIsland, color = "StatenIsland")) +
+  geom_point(aes(y = StatenIsland, color = "StatenIsland")) +
+  theme(
+    legend.direction = "vertical",
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 14),
+    legend.justification = c("right", "top"),
+    legend.box.just = "right",
+    legend.margin = margin(4, 4, 4, 4),
+    axis.text.x = element_text(angle = 0),
+    text = element_text(size = 16)
+  ) +
+  scale_color_manual(
+    labels = c(
+      "Bronx",
+      "Brooklyn",
+      "Manhattan",
+      "Queens",
+      "Staten Island"
+    ),
+    values = c("firebrick3", "slateblue", "green4", "gold3", "deepskyblue3")
+  ) +
+  labs(title = "Poverty Rate by Borough: 2006-2018", y = NULL, x = NULL)
+```
+
+```{r poverty_rate_table, echo=FALSE, message=FALSE, warning=FALSE,fig.dim = c(9, 6), fig.align="center"}
+poverty_rate_table <- poverty_rate %>%
+  select(c(period, Bronx, Brooklyn, Manhattan, Queens, `StatenIsland`))
+kable(
+  poverty_rate_table,
+  align = "ccccc",
+  digits = 1,
+  linesep = "",
+  format = "latex",
+  col.names = c(
+    "Year",
+    "Bronx",
+    "Brooklyn",
+    "Manhattan",
+    "Queens",
+    "Staten Island"
+  ),
+  caption = "Poverty Rates by Borough: 2006 to 2018",
+  booktabs = T
+) %>%
+  kable_styling(latex_options = c("striped", "HOLD_position"),
+                position = "center") %>%
+  column_spec(column = 1, width = "2cm") %>%
+  column_spec(column = 2, width = "2cm") %>%
+  column_spec(column = 3, width = "2cm") %>%
+  column_spec(column = 4, width = "2cm") %>%
+  column_spec(column = 5, width = "2cm") %>%
+  column_spec(column = 6, width = "2cm")
+```
+
+\newpage
+
+## Data Model Summary
+
+After looking at the historical trends by borough and demographic categories, I created a linear model to examine the correlation between poverty rates and the rates of shooting incidents per thousand people within each borough. The model was tested by adding a new column to the shooting incidents table for the predicted number of shooting incidents per borough based on the poverty rate within a borough for a given year. While the model does indicate a degree of correlation, ultimately there is enough variation between the actual and predicted totals to suggest that there might be some additional factors which are also influencing these rates of shooting incidents in New York City, in which case it could be more appropriate to factor in poverty rates using a multivariate data model.
+
+```{r model_chart,echo=FALSE, message=FALSE, fig.dim = c(12, 8), fig.align="center"}
+final_counts_by_year %>%
+  ggplot(aes(x = YEAR, y = Shooting_Incidents)) +
+  scale_x_continuous(breaks = seq(2006, 2018, 1)) +
+  scale_y_continuous(limits = c(0, 2300)) +
+  geom_line(aes(color = "Shooting_Incidents")) +
+  geom_point(aes(color = "Shooting_Incidents")) +
+  geom_line(aes(y = Predicted_Shooting_Incidents, color = "Predicted_Shooting_Incidents")) +
+  geom_point(aes(y = Predicted_Shooting_Incidents, color = "Predicted_Shooting_Incidents")) +
+  theme_bw() +
+  theme(
+    legend.direction = "vertical",
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 14),
+    legend.justification = c("right", "top"),
+    legend.box.just = "right",
+    legend.margin = margin(4, 4, 4, 4),
+    axis.text.x = element_text(angle = 0),
+    text = element_text(size = 16)
+  ) +
+  scale_color_manual(
+    labels = c(
+      "Actual Shooting Incidents",
+      "Predicted Shooting Incidents"
+    ),
+    values = c("slateblue", "gold3")
+  ) +
+  labs(title = "Model Predicted Totals vs Actual Totals: 2006-2018", y =
+         NULL, x = NULL)
+```
+
+```{r model_prediction_results_table, echo=FALSE, message=FALSE, warning=FALSE,fig.dim = c(9, 6), fig.align="center"}
+kable(
+  final_counts,
+  align = "lcc",
+  digits = 0,
+  linesep = "",
+  format = "latex",
+  format.args = list(big.mark = ","),
+  col.names = c(
+    "Borough",
+    "Reported Shooting Incidents",
+    "Predicted Shooting Incidents"
+  ),
+  caption = "Poverty Rate Model: Predicted Shooting Incidents per Borough",
+  booktabs = T
+) %>%
+  kable_styling(latex_options = c("striped", "HOLD_position"), position = "center") %>%
+  column_spec(column = 1, width = "3.5cm") %>%
+  column_spec(column = 2, width = "4cm") %>%
+  column_spec(column = 3, width = "4cm")
+```
+
+
+\newpage
+
+```{r model_predictions, echo=FALSE,message=FALSE, fig.dim = c(6, 4), fig.align="center"}
+summary(poverty_model_new)
+```
+
+### Session Info
+
+```{r session, echo=FALSE}
+sessionInfo()
+```
